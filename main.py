@@ -20,7 +20,10 @@ load_dotenv()
 TOKEN_LIMIT = 180000  # maximum tokens allowed per minute
 TOKENS_USED_THIS_MINUTE = 0
 START_TIME = time.time()
-
+MAX_TOKENS = 2000  # maximum tokens allowed per API call
+BUFFER = 50
+CONTEXT_BUFFER = 200  # tokens you reserve for context
+RESPONSE_BUFFER = 100
 @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
 def call_openai_api(model, messages, estimated_tokens):
     print(f"Calling OpenAI API with {estimated_tokens} tokens")
@@ -48,6 +51,73 @@ def count_tokens(text):
     num_tokens = len(encoding.encode(text))
     return num_tokens
 
+def split_text_old(text, max_tokens):
+    words = text.split()
+    current_tokens = 0
+    current_chunk = []
+    chunks = []
+
+    for word in words:
+        word_token_count = count_tokens(word)
+
+        if current_tokens + word_token_count > max_tokens:
+            chunks.append(' '.join(current_chunk))
+            current_tokens = 0
+            current_chunk = []
+
+        current_tokens += word_token_count
+        current_chunk.append(word)
+
+    if current_chunk:
+        chunks.append(' '.join(current_chunk))
+
+    return chunks
+
+
+# def segment_email(email_content):
+#     paragraphs = [p.strip() for p in email_content.split('\n') if p.strip()]
+#
+#     segments = []
+#     for paragraph in paragraphs:
+#         if count_tokens(paragraph) > MAX_TOKENS - BUFFER:
+#             # Splitting the large paragraph further
+#             segments.extend(split_large_paragraph(paragraph, MAX_TOKENS - BUFFER))
+#         else:
+#             segments.append(paragraph)
+#
+#     return segments
+def segment_email(email_content, previous_context=""):
+    total_buffer = RESPONSE_BUFFER  # always consider RESPONSE_BUFFER
+
+    if previous_context:
+        total_buffer += CONTEXT_BUFFER
+        combined_content_tokens = count_tokens(email_content) + count_tokens(previous_context)
+    else:
+        print(type(email_content), email_content)
+        combined_content_tokens = count_tokens(email_content)
+
+    if combined_content_tokens <= MAX_TOKENS - RESPONSE_BUFFER:
+        return [email_content]
+
+    # Otherwise, split the email content
+    available_tokens = MAX_TOKENS - total_buffer
+    return binary_search_split(email_content, available_tokens)
+def split_large_paragraph(paragraph, max_tokens):
+    words = paragraph.split()
+    segments = []
+    current_segment = ""
+
+    for word in words:
+        if count_tokens(current_segment + word) <= max_tokens:
+            current_segment += word + " "
+        else:
+            segments.append(current_segment.strip())
+            current_segment = word + " "
+
+    if current_segment:
+        segments.append(current_segment.strip())
+
+    return segments
 def split_text(text, max_length):
     """Splits the text into chunks of max_length, ideally at sentence boundaries."""
     sentences = text.split('. ')
@@ -65,7 +135,31 @@ def split_text(text, max_length):
         chunks.append(current_chunk)
 
     return chunks
+def binary_search_split(text, max_tokens):
+    low, high = 0, len(text)
+    mid_point = (low + high) // 2
 
+    while low <= mid_point:
+        current_subtext = text[low:mid_point]
+        if count_tokens(current_subtext) > max_tokens:
+            # Current subtext is too large, adjust the high boundary
+            high = mid_point
+        else:
+            # Current subtext fits, adjust the low boundary
+            low = mid_point
+
+        mid_point = (low + high) // 2
+
+        # Stop if no further adjustments
+        if mid_point == low or mid_point == high:
+            break
+
+    # Recurse for remaining text if any
+    segments = [text[:mid_point]]
+    if mid_point < len(text):
+        segments.extend(binary_search_split(text[mid_point:], max_tokens))
+
+    return segments
 def send_gmail(subject, body, to_email, service):
     # Create a MIMEText email
     email = MIMEText(body)
@@ -91,6 +185,26 @@ def get_email_subject_and_sender(msg):
     sender_name = match.group(1).strip() if match else sender_full
 
     return original_subject, sender_name
+
+def get_body_from_message(message):
+    print(message)
+    if 'parts' in message['payload']:
+        print('multipart email')
+        # Multipart email, walk through all parts
+        for part in message['payload']['parts']:
+            print(part)
+            mimeType = part.get('mimeType', '')
+            if mimeType == 'text/plain':
+                print('text/plain')
+                return base64.urlsafe_b64decode(part['body']['data']).decode('utf-8')
+            elif mimeType == 'text/html':
+                print('text/html')
+                return base64.urlsafe_b64decode(part['body']['data']).decode('utf-8')
+    else:
+        print('simple email or html only')
+        # Simple email without parts or HTML only
+        return base64.urlsafe_b64decode(message['payload']['body']['data']).decode('utf-8')
+    return None
 
 
 def modify_email_labels(service, user_id, msg_id, add_label_ids, remove_label_ids):
@@ -154,14 +268,16 @@ for message in messages:
     email_data = base64.urlsafe_b64decode(msg['raw'].encode('ASCII'))
     mail_body = email_data.decode('utf-8')
     original_subject, sender_name = get_email_subject_and_sender(structuredMsg)
+    structured_mail_body = get_body_from_message(structuredMsg)
 
     # Splitting the text into chunks
-    chunks = split_text(mail_body, 2048)  # Assuming 2048 is the model's token limit
-
+    chunks = segment_email(structured_mail_body)
+    for idx, segment in enumerate(chunks, 1):
+        print(f"Segment {idx}:\n{chunks}\n{'-' * 50}\n")
     # Sending each chunk to the model and collecting results
     results = []
     for chunk in chunks:
-        estimated_tokens = count_tokens(chunk)
+        estimated_tokens = 1.5 * (count_tokens(chunk))
         prompt = (f"Summarize the following email (or subsection of an email), ensuring that action items are listed with bullet points. "
                   f"Also, identify any events in the format 'Event Detected: [Event Name] on [Date] at [Time] at [Location]':\n\n{chunk}")
         response = call_openai_api(
@@ -170,13 +286,15 @@ for message in messages:
             estimated_tokens=estimated_tokens,
         )
         results.append(response)
+        print(f"Response: {response.choices[0].message['content']}\n\n")
     tldr_summary = "\n\n".join([r.choices[0].message['content'] for r in results])
+    print(f"Summary: {tldr_summary}\n\n")
     # take the tldr_summary and ask openai to make sure it makes sense
-    final_prompt = f"Review and ensure this summary makes sense, ensuring that action items are listed with bullet points. Also, identify any events in the format 'Event Detected: [Event Name] on [Date] at [Time] at [Location] {tldr_summary}"
+    final_prompt = f"Summarize the following, ensuring bullet points are used and that any links/dates/times/locations are preserved {tldr_summary}"
     final_response = call_openai_api(
         model="gpt-3.5-turbo-16k",
         messages=[{"role": "user", "content": final_prompt}],
-        estimated_tokens=count_tokens(final_prompt)
+        estimated_tokens=1.5*(count_tokens(final_prompt))
     )
     tldr_summary = final_response.choices[0].message['content']
 

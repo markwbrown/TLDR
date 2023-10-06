@@ -1,7 +1,6 @@
 credentials.json
 gmail-token.json
 
-
 # JetBrains IDE
 .idea/
 *.iml
